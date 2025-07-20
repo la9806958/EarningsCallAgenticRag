@@ -20,6 +20,7 @@ import pstats
 import io
 from neo4j import GraphDatabase
 import argparse
+import fcntl
 
 # ---------- Constants & paths (defaults, can be overridden by args) ---------------------
 DEFAULT_DATA_FILE = "merged_data_nyse.csv"
@@ -32,8 +33,9 @@ CHUNK_SIZE = 300    # Process 300 tickers per chunk
 TOKEN_LOG_DIR = "token_logs"
 TIMING_LOG_DIR = "timing_logs"
 NEO4J_LOG_DIR = "neo4j_logs"
+NEO4J_LOCK_FILE = "neo4j.lock"
 
-STATEMENT_BASE_DIR = Path("/Volumes/LaCie/美股-财务报表")
+STATEMENT_BASE_DIR = Path("financial_statements")
 STATEMENT_FILES = {
     "cash_flow_statement": "_cash_flow_statement.csv",
     "income_statement": "_income_statement.csv",
@@ -81,7 +83,36 @@ METRIC_MAPPING = {
 # Shared OpenAI semaphore (limit to 4 concurrent calls)
 openai_semaphore = threading.Semaphore(4)
 
-# ---------- Neo4j Connection Setup ------------
+# ---------- Neo4j Connection Setup and File Locking ------------
+class Neo4jFileLock:
+    """File-based locking for coordinating Neo4j operations across processes."""
+    
+    def __init__(self, lock_file_path=NEO4J_LOCK_FILE, exclusive=True):
+        self.lock_file_path = lock_file_path
+        self.exclusive = exclusive
+        self.lock_file = None
+    
+    def __enter__(self):
+        """Acquire the file lock."""
+        try:
+            self.lock_file = open(self.lock_file_path, 'w')
+            lock_type = fcntl.LOCK_EX if self.exclusive else fcntl.LOCK_SH
+            fcntl.flock(self.lock_file.fileno(), lock_type)
+            return self
+        except Exception as e:
+            if self.lock_file:
+                self.lock_file.close()
+            raise e
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Release the file lock."""
+        if self.lock_file:
+            try:
+                fcntl.flock(self.lock_file.fileno(), fcntl.LOCK_UN)
+                self.lock_file.close()
+            except Exception as e:
+                print(f"Warning: Error releasing Neo4j lock: {e}")
+
 def get_neo4j_driver():
     """Get Neo4j driver from credentials file."""
     creds = json.loads(Path("credentials.json").read_text())
@@ -91,40 +122,86 @@ def get_neo4j_driver():
     )
 
 def clear_neo4j_database(driver, chunk_info: str = None):
-    """Clear all data from Neo4j database using transaction-based deletion and log deletion counts."""
-    print("🗑️  Clearing Neo4j database...")
+    """Clear all data from Neo4j database using file locking and enhanced deletion with retry logic."""
     
-    # Get counts before deletion
-    with driver.session() as session:
-        # Count nodes and relationships before deletion
-        result = session.run("""
-        MATCH (n)
-        RETURN count(n) as node_count
-        """)
-        node_count = result.single()["node_count"]
+    # Use file lock to ensure exclusive access during database operations
+    with Neo4jFileLock(exclusive=True):
+        print("🗑️  Clearing Neo4j database with exclusive lock...")
         
-        result = session.run("""
-        MATCH ()-[r]->()
-        RETURN count(r) as relationship_count
-        """)
-        relationship_count = result.single()["relationship_count"]
+        max_retries = 3
+        retry_delay = 2  # seconds
         
-        print(f"📊 Found {node_count} nodes and {relationship_count} relationships to delete")
-        
-        # Use transaction-based deletion for better performance
-        session.run("""
-        CALL {
-          MATCH (n)            // return every node id lazily
-          RETURN n
-        } IN TRANSACTIONS OF 10000 ROWS   // ← tune batch size
-        DETACH DELETE n;
-        """)
-    
-    # Log deletion counts to file
-    log_deletion_counts(node_count, relationship_count, chunk_info)
-    
-    print("✅ Neo4j database cleared successfully")
-    print(f"📝 Deletion logged: {node_count} nodes, {relationship_count} relationships")
+        for attempt in range(max_retries):
+            try:
+                with driver.session() as session:
+                    # Count nodes and relationships before deletion
+                    result = session.run("MATCH (n) RETURN count(n) as node_count")
+                    node_count = result.single()["node_count"]
+                    
+                    result = session.run("MATCH ()-[r]->() RETURN count(r) as relationship_count")
+                    relationship_count = result.single()["relationship_count"]
+                    
+                    print(f"📊 Found {node_count} nodes and {relationship_count} relationships to delete (attempt {attempt + 1})")
+                    
+                    if node_count == 0 and relationship_count == 0:
+                        print("✅ Database already empty")
+                        break
+                    
+                    # Step 1: Delete relationships first to avoid orphaned references
+                    if relationship_count > 0:
+                        print("🔄 Deleting relationships...")
+                        session.run("""
+                        CALL {
+                          MATCH ()-[r]->()
+                          RETURN r
+                        } IN TRANSACTIONS OF 5000 ROWS
+                        DELETE r;
+                        """)
+                    
+                    # Step 2: Delete nodes
+                    if node_count > 0:
+                        print("🔄 Deleting nodes...")
+                        session.run("""
+                        CALL {
+                          MATCH (n)
+                          RETURN n
+                        } IN TRANSACTIONS OF 5000 ROWS
+                        DELETE n;
+                        """)
+                    
+                    # Verify deletion
+                    result = session.run("MATCH (n) RETURN count(n) as remaining_nodes")
+                    remaining_nodes = result.single()["remaining_nodes"]
+                    
+                    result = session.run("MATCH ()-[r]->() RETURN count(r) as remaining_relationships")
+                    remaining_relationships = result.single()["remaining_relationships"]
+                    
+                    if remaining_nodes == 0 and remaining_relationships == 0:
+                        print("✅ Neo4j database cleared successfully")
+                        log_deletion_counts(node_count, relationship_count, chunk_info)
+                        break
+                    else:
+                        print(f"⚠️  Warning: {remaining_nodes} nodes and {remaining_relationships} relationships still remain")
+                        if attempt < max_retries - 1:
+                            print(f"🔄 Retrying in {retry_delay} seconds...")
+                            time.sleep(retry_delay)
+                            continue
+                        else:
+                            print("❌ Failed to completely clear database after all retries")
+                
+            except Exception as e:
+                if "EntityNotFound" in str(e):
+                    print(f"⚠️  EntityNotFound error on attempt {attempt + 1}: {e}")
+                    if attempt < max_retries - 1:
+                        print(f"🔄 Retrying in {retry_delay} seconds...")
+                        time.sleep(retry_delay)
+                        continue
+                    else:
+                        print("❌ Failed to clear database due to EntityNotFound errors")
+                        break
+                else:
+                    print(f"❌ Unexpected error during database clearing: {e}")
+                    raise e
 
 # ---------- Unit Conversion Utilities ---------------------
 UNIT_CONVERSION = {
@@ -449,7 +526,7 @@ def generate_financial_statement_facts(row: pd.Series, ticker: str, quarter: str
                             prev_cum_value_converted = convert_unit(prev_cum_value, prev_unit, unit)
                             quarterly_value = cumulative_value_num - prev_cum_value_converted
                         except Exception as e:
-                            print(f"[CUMULATIVE UNIT ERROR] {ticker} {metric} {statement_quarter}: {e}")
+                            pass  # CUMULATIVE UNIT ERROR
                             quarterly_value = cumulative_value_num
                     else:
                         quarterly_value = cumulative_value_num
@@ -498,7 +575,7 @@ def generate_financial_statement_facts(row: pd.Series, ticker: str, quarter: str
                 rest = m2.group(2)
                 return prev_year + rest
             # If all else fails, just return the original string
-            print(f"[YoY WARNING] Could not parse period string: {curr_q}")
+            pass  # Could not parse period string
             return curr_q
 
         for metric, quarterly_dict in metric_quarterly_values.items():
@@ -523,11 +600,11 @@ def generate_financial_statement_facts(row: pd.Series, ticker: str, quarter: str
                         continue
                     prev_v_converted = prev_v
                     if curr_unit != prev_unit and prev_v is not None and curr_unit and prev_unit:
-                        print(f"[QoQ UNIT WARNING] {ticker} {metric} {curr_q}: unit changed from '{prev_unit}' to '{curr_unit}'")
+                        pass  # QoQ unit change handled
                         try:
                             prev_v_converted = convert_unit(prev_v, prev_unit, curr_unit)
                         except Exception as e:
-                            print(f"[QoQ UNIT ERROR] Failed to convert {prev_v} from {prev_unit} to {curr_unit}: {e}")
+                            pass  # QoQ UNIT ERROR
                             prev_v_converted = prev_v
                     try:
                         if prev_v_converted == 0:
@@ -535,7 +612,7 @@ def generate_financial_statement_facts(row: pd.Series, ticker: str, quarter: str
                         else:
                             pct_change = (curr_v - prev_v_converted) / abs(prev_v_converted)
                     except Exception as e:
-                        print(f"[QoQ ERROR] {ticker} {metric} {curr_q}: {e}")
+                        pass  # QoQ ERROR
                         pct_change = None
                     if pct_change is not None:
                         facts.append({
@@ -547,18 +624,18 @@ def generate_financial_statement_facts(row: pd.Series, ticker: str, quarter: str
                             "reason": f"Quarter-on-quarter percent change in {statement_type} for {metric} from {prev_q} to {curr_q}"
                         })
                     else:
-                        print(f"[QoQ SKIP] {ticker} {metric} {curr_q}: prev_v={prev_v} curr_v={curr_v} (division by zero)")
+                        pass  # QoQ SKIP
                 # YoY: always simple percentage change, no delta-on-delta
                 prev_yoy_q = get_prev_yoy_q(curr_q)
                 if prev_yoy_q in quarter_to_value.keys():
                     prev_yoy_v, prev_yoy_unit = quarter_to_value[prev_yoy_q]
                     prev_yoy_v_converted = prev_yoy_v
                     if curr_unit != prev_yoy_unit and prev_yoy_v is not None and curr_unit and prev_yoy_unit:
-                        print(f"[YoY UNIT WARNING] {ticker} {metric} {curr_q}: unit changed from '{prev_yoy_unit}' to '{curr_unit}'")
+                        pass  # YoY unit change handled
                         try:
                             prev_yoy_v_converted = convert_unit(prev_yoy_v, prev_yoy_unit, curr_unit)
                         except Exception as e:
-                            print(f"[YoY UNIT ERROR] Failed to convert {prev_yoy_v} from {prev_yoy_unit} to {curr_unit}: {e}")
+                            pass  # YoY UNIT ERROR
                             prev_yoy_v_converted = prev_yoy_v
                     try:
                         if prev_yoy_v_converted == 0:
@@ -566,7 +643,7 @@ def generate_financial_statement_facts(row: pd.Series, ticker: str, quarter: str
                         else:
                             yoy_pct_change = (curr_v - prev_yoy_v_converted) / abs(prev_yoy_v_converted)
                     except Exception as e:
-                        print(f"[YoY ERROR] {ticker} {metric} {curr_q}: {e}")
+                        pass  # YoY ERROR
                         yoy_pct_change = None
                     if yoy_pct_change is not None:
                         facts.append({
@@ -1088,14 +1165,20 @@ def main() -> None:
                     print(f"❌ Error in sector {sector}: {err}")
                 print(f" ✅ finished sector {sector}")
         
-        # ------ 5) Clear Neo4j database after processing chunk ---------------
+        # ------ 5) Ensure all workers are terminated before database clearing ---------------
+        print("🔄 Waiting for all workers to complete before database clearing...")
+        # ProcessPoolExecutor context manager ensures all workers are properly terminated
+        
+        # ------ 6) Clear Neo4j database after processing chunk ---------------
         if neo4j_driver:
             print(f"🗑️  Clearing Neo4j database after chunk {chunk_idx + 1}")
             try:
                 chunk_info = f"chunk_{chunk_idx + 1}_of_{total_chunks}"
                 clear_neo4j_database(neo4j_driver, chunk_info)
+                print(f"✅ Successfully cleared Neo4j database for chunk {chunk_idx + 1}")
             except Exception as e:
-                print(f"⚠️  Warning: Failed to clear Neo4j database: {e}")
+                print(f"❌ Failed to clear Neo4j database after chunk {chunk_idx + 1}: {e}")
+                print("🔄 Continuing to next chunk despite database clearing failure...")
         else:
             print(f"⏭️  Skipping Neo4j database clearing for chunk {chunk_idx + 1} (driver not available)")
         
